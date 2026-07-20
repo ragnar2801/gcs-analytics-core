@@ -33,6 +33,12 @@ These settings control how aggressively the library prefetches and caches metada
 | `analytics-core.small-file.cache.threshold-bytes` | Threshold (in bytes) below which small files are cached entirely. | `1048576` (1 MB) |
 | `analytics-core.small-file.cache.enabled` | Controls whether the small object cache is enabled. | `false` |
 | `analytics-core.small-file.cache.max-size-bytes` | The maximum capacity (in bytes) to hold in the small object cache. | `209715200` (200 MB) |
+| `analytics-core.cache.disk.enabled` | Controls whether the worker-level (host-shared) disk cache is enabled. When enabled, footers and small objects are also cached on local disk (ideally SSD) in a directory shared by all executor processes on the host. | `false` |
+| `analytics-core.cache.disk.directory` | Local directory backing the disk cache. Every executor process on the host must point at the same directory to share entries. Required when the disk cache is enabled. | - |
+| `analytics-core.cache.disk.max-size-bytes` | The maximum total size (in bytes) of the disk cache. Enforced by admission control: writes are skipped once the limit is reached. | `10737418240` (10 GB) |
+| `analytics-core.cache.disk.ttl-millis` | Time-to-live (in milliseconds) of a disk cache entry, measured from creation. `0` disables TTL-based expiry. Entries are keyed by object generation, so TTL is a disk-hygiene bound, not a correctness bound. | `86400000` (24 h) |
+| `analytics-core.cache.disk.eviction.high-watermark` | Usage fraction of the maximum size above which background LRU eviction starts. | `0.95` |
+| `analytics-core.cache.disk.eviction.low-watermark` | Usage fraction of the maximum size down to which background LRU eviction proceeds. | `0.85` |
 
 ### Read Performance and I/O Tuning
 
