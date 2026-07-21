@@ -36,6 +36,9 @@ class AnalyticsCacheManagerTest {
 
   @BeforeEach
   void setUp() {
+    // The footer and small object caches are JVM-wide statics; reset them so each test starts
+    // from a clean slate and its GcsCacheOptions take effect.
+    AnalyticsCacheManager.resetCaches();
     manager =
         new AnalyticsCacheManager(GcsCacheOptions.builder().setFooterCacheEnabled(true).build());
   }
@@ -80,6 +83,7 @@ class AnalyticsCacheManagerTest {
 
   @Test
   void getFooter_cacheDisabled_anyKey_callsLoaderEveryTime() throws IOException {
+    AnalyticsCacheManager.resetCaches();
     manager =
         new AnalyticsCacheManager(GcsCacheOptions.builder().setFooterCacheEnabled(false).build());
     AtomicInteger callCount = new AtomicInteger(0);
@@ -97,6 +101,7 @@ class AnalyticsCacheManagerTest {
 
   @Test
   void invalidateFooter_cacheDisabled_anyKey_succeeds() {
+    AnalyticsCacheManager.resetCaches();
     manager =
         new AnalyticsCacheManager(GcsCacheOptions.builder().setFooterCacheEnabled(false).build());
 
@@ -105,6 +110,7 @@ class AnalyticsCacheManagerTest {
 
   @Test
   void invalidateAll_cacheDisabled_anyKey_succeeds() {
+    AnalyticsCacheManager.resetCaches();
     manager =
         new AnalyticsCacheManager(GcsCacheOptions.builder().setFooterCacheEnabled(false).build());
 
@@ -118,6 +124,7 @@ class AnalyticsCacheManagerTest {
             .setSmallObjectCacheEnabled(true)
             .setSmallObjectCacheMaxSizeBytes(200)
             .build();
+    AnalyticsCacheManager.resetCaches();
     manager = new AnalyticsCacheManager(cacheOptions);
     manager.getSmallObject(ITEM_ID, itemId -> FOOTER.duplicate());
 
