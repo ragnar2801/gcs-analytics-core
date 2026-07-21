@@ -21,11 +21,13 @@ import static com.google.common.base.Preconditions.checkNotNull;
 import com.github.benmanes.caffeine.cache.Weigher;
 import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCache;
 import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCacheCaffeineImpl;
+import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCacheHybridImpl;
 import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCacheNoOpImpl;
-import com.google.cloud.gcs.analyticscore.common.cache.ThrowingFunction;
+import com.google.cloud.gcs.analyticscore.common.cache.disk.AnalyticsCacheDiskImpl;
 import com.google.cloud.gcs.analyticscore.common.cache.disk.SharedDiskCache;
 import com.google.cloud.gcs.analyticscore.common.cache.disk.SharedDiskCacheOptions;
 import com.google.cloud.gcs.analyticscore.common.telemetry.Telemetry;
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.ImmutableList;
 import java.io.IOException;
 import java.nio.ByteBuffer;
@@ -38,10 +40,17 @@ import org.slf4j.LoggerFactory;
  * Manages the caching layer for GCS objects. This class is thread-safe and acts as a registry for
  * various specialized caches (e.g., Parquet footer cache).
  *
- * <p>When the disk cache is enabled, the in-memory footer and small object caches act as an L1 tier
- * over a worker-level {@link SharedDiskCache} L2 tier that is shared by every executor process on
- * the host. Only objects with a known content generation participate in the disk tier, because GCS
- * content is immutable per generation and such entries can never be stale.
+ * <p>The footer and small object caches are held in JVM-wide static fields so they are shared by
+ * every {@link GcsFileSystem} instance in an executor process — the metadata a task caches is
+ * reused by later tasks regardless of which filesystem instance opened the file. Their
+ * configuration is fixed by the first manager constructed in the JVM.
+ *
+ * <p>When the worker-level disk cache is enabled, each in-memory cache becomes the L1 tier of an
+ * {@link AnalyticsCacheHybridImpl} whose L2 tier is a {@link SharedDiskCache} shared by every
+ * executor process on the host. A single disk engine (one directory, one size budget, one eviction
+ * janitor) backs both the footer and small object tiers; entries are distinguished by a key prefix.
+ * Only objects with a known content generation are persisted to disk, because GCS content is
+ * immutable per generation and such entries can never be stale.
  */
 public class AnalyticsCacheManager {
 
@@ -56,10 +65,10 @@ public class AnalyticsCacheManager {
   private static final String FOOTER_DISK_ENTRY_KIND = "footer";
   private static final String SMALL_OBJECT_DISK_ENTRY_KIND = "small-object";
 
-  private final AnalyticsCache<GcsItemId, ByteBuffer> footerCache;
-  private final AnalyticsCache<GcsItemId, ByteBuffer> smallObjectCache;
+  private static volatile AnalyticsCache<GcsItemId, ByteBuffer> footerCache;
+  private static volatile AnalyticsCache<GcsItemId, ByteBuffer> smallObjectCache;
+
   private final AnalyticsCache<String, BucketProperties> bucketPropertiesCache;
-  private final Optional<SharedDiskCache> diskCache;
 
   /**
    * Creates a new {@link AnalyticsCacheManager} with the specified options and no telemetry
@@ -80,19 +89,73 @@ public class AnalyticsCacheManager {
   public AnalyticsCacheManager(GcsCacheOptions options, Telemetry telemetry) {
     checkNotNull(options, "options cannot be null");
     checkNotNull(telemetry, "telemetry cannot be null");
-    Weigher<GcsItemId, ByteBuffer> weigher = (key, value) -> value.remaining();
-    this.footerCache =
-        options.isFooterCacheEnabled()
-            ? AnalyticsCacheCaffeineImpl.create(options.getFooterCacheMaxSizeBytes(), weigher)
-            : AnalyticsCacheNoOpImpl.getInstance();
-    this.smallObjectCache =
-        options.isSmallObjectCacheEnabled()
-            ? AnalyticsCacheCaffeineImpl.create(options.getSmallObjectCacheMaxSizeBytes(), weigher)
-            : AnalyticsCacheNoOpImpl.getInstance();
+    initializeStaticCaches(options, telemetry);
     this.bucketPropertiesCache =
         AnalyticsCacheCaffeineImpl.createWithTtlOnly(
             BUCKET_PROPERTIES_CACHE_TTL_MINUTES, TimeUnit.MINUTES);
-    this.diskCache = createDiskCache(options, telemetry);
+  }
+
+  private static void initializeStaticCaches(GcsCacheOptions options, Telemetry telemetry) {
+    if (footerCache != null && smallObjectCache != null) {
+      return;
+    }
+    Weigher<GcsItemId, ByteBuffer> weigher = (key, value) -> value.remaining();
+    synchronized (AnalyticsCacheManager.class) {
+      Optional<SharedDiskCache> diskCache = createDiskCache(options, telemetry);
+      if (footerCache == null) {
+        footerCache =
+            createCache(
+                options.isFooterCacheEnabled(),
+                options.getFooterCacheMaxSizeBytes(),
+                weigher,
+                diskCache,
+                FOOTER_DISK_ENTRY_KIND);
+      }
+      if (smallObjectCache == null) {
+        smallObjectCache =
+            createCache(
+                options.isSmallObjectCacheEnabled(),
+                options.getSmallObjectCacheMaxSizeBytes(),
+                weigher,
+                diskCache,
+                SMALL_OBJECT_DISK_ENTRY_KIND);
+      }
+    }
+  }
+
+  /**
+   * Composes the caching tiers for one cache kind: an in-memory L1 (when the memory cache is
+   * enabled) over a shared disk L2 (when the disk cache is available). Returns a no-op cache when
+   * neither tier is active.
+   */
+  private static AnalyticsCache<GcsItemId, ByteBuffer> createCache(
+      boolean memoryCacheEnabled,
+      long memoryCacheMaxSizeBytes,
+      Weigher<GcsItemId, ByteBuffer> weigher,
+      Optional<SharedDiskCache> diskCache,
+      String entryKind) {
+    AnalyticsCache<GcsItemId, ByteBuffer> l1Cache =
+        memoryCacheEnabled
+            ? AnalyticsCacheCaffeineImpl.create(memoryCacheMaxSizeBytes, weigher)
+            : null;
+    AnalyticsCache<GcsItemId, ByteBuffer> l2Cache =
+        diskCache
+            .<AnalyticsCache<GcsItemId, ByteBuffer>>map(
+                engine ->
+                    AnalyticsCacheDiskImpl.create(
+                        engine, itemId -> diskEntryKey(itemId, entryKind)))
+            .orElse(null);
+
+    if (l1Cache != null && l2Cache != null) {
+      return AnalyticsCacheHybridImpl.create(l1Cache, l2Cache);
+    }
+    if (l1Cache != null) {
+      return l1Cache;
+    }
+    if (l2Cache != null) {
+      return l2Cache;
+    }
+    return AnalyticsCacheNoOpImpl.getInstance();
   }
 
   private static Optional<SharedDiskCache> createDiskCache(
@@ -117,6 +180,25 @@ public class AnalyticsCacheManager {
   }
 
   /**
+   * Returns the disk entry key for {@code itemId}, or {@link Optional#empty()} when the object's
+   * content generation is unknown and must therefore not be persisted on disk. The {@code
+   * entryKind} prefix keeps footer and small object entries distinct within the shared engine.
+   */
+  private static Optional<String> diskEntryKey(GcsItemId itemId, String entryKind) {
+    return itemId
+        .getContentGeneration()
+        .map(
+            generation ->
+                entryKind
+                    + '/'
+                    + itemId.getBucketName()
+                    + '/'
+                    + itemId.getObjectName().orElse("")
+                    + '#'
+                    + generation);
+  }
+
+  /**
    * Returns the cached footer for the given {@code itemId}, obtaining it from the {@code
    * footerLoader} if necessary. This method is atomic; the {@code footerLoader} will be applied at
    * most once per itemId during concurrent access.
@@ -130,12 +212,7 @@ public class AnalyticsCacheManager {
     checkNotNull(itemId, "itemId cannot be null");
     checkNotNull(footerLoader, "footerLoader cannot be null");
 
-    return footerCache
-        .get(
-            itemId,
-            cachedItemId ->
-                loadThroughDiskCache(cachedItemId, FOOTER_DISK_ENTRY_KIND, footerLoader::load))
-        .asReadOnlyBuffer();
+    return footerCache.get(itemId, footerLoader::load).asReadOnlyBuffer();
   }
 
   /**
@@ -149,59 +226,19 @@ public class AnalyticsCacheManager {
     checkNotNull(itemId, "itemId cannot be null");
     checkNotNull(smallObjectLoader, "smallObjectLoader cannot be null");
 
-    return smallObjectCache
-        .get(
-            itemId,
-            cachedItemId ->
-                loadThroughDiskCache(
-                    cachedItemId, SMALL_OBJECT_DISK_ENTRY_KIND, smallObjectLoader::load))
-        .asReadOnlyBuffer();
+    return smallObjectCache.get(itemId, smallObjectLoader::load).asReadOnlyBuffer();
   }
 
-  /** Invalidates the cached footer for the given {@code itemId}. */
+  /** Invalidates the cached footer for the given {@code itemId} in every tier. */
   public void invalidateFooter(GcsItemId itemId) {
     checkNotNull(itemId, "itemId cannot be null");
     footerCache.invalidate(itemId);
-    invalidateDiskEntry(itemId, FOOTER_DISK_ENTRY_KIND);
   }
 
-  /** Invalidates the cached small object for the given {@code itemId}. */
+  /** Invalidates the cached small object for the given {@code itemId} in every tier. */
   public void invalidateSmallObject(GcsItemId itemId) {
     checkNotNull(itemId, "itemId cannot be null");
     smallObjectCache.invalidate(itemId);
-    invalidateDiskEntry(itemId, SMALL_OBJECT_DISK_ENTRY_KIND);
-  }
-
-  /**
-   * Loads a value through the worker-level disk cache when it is enabled and the object's content
-   * generation is known; otherwise falls straight through to the loader. Entries are keyed by
-   * generation, so a cached value can never be stale.
-   */
-  private ByteBuffer loadThroughDiskCache(
-      GcsItemId itemId,
-      String entryKind,
-      ThrowingFunction<GcsItemId, ByteBuffer, IOException> loader)
-      throws IOException {
-    if (!diskCache.isPresent() || !itemId.getContentGeneration().isPresent()) {
-      return loader.apply(itemId);
-    }
-    return diskCache.get().getOrLoad(diskEntryKey(itemId, entryKind), () -> loader.apply(itemId));
-  }
-
-  private void invalidateDiskEntry(GcsItemId itemId, String entryKind) {
-    if (diskCache.isPresent() && itemId.getContentGeneration().isPresent()) {
-      diskCache.get().invalidate(diskEntryKey(itemId, entryKind));
-    }
-  }
-
-  private static String diskEntryKey(GcsItemId itemId, String entryKind) {
-    return itemId.getBucketName()
-        + '/'
-        + itemId.getObjectName().orElse("")
-        + '#'
-        + itemId.getContentGeneration().get()
-        + '#'
-        + entryKind;
   }
 
   /**
@@ -225,14 +262,25 @@ public class AnalyticsCacheManager {
   }
 
   /**
-   * Invalidates all in-memory cached entries. The worker-level disk cache is left untouched: it is
+   * Invalidates all in-memory cached entries. The worker-level disk tier is left untouched: it is
    * shared with other executor processes on the host, and its generation-keyed entries cannot be
-   * stale.
+   * stale (see {@link AnalyticsCacheDiskImpl#invalidateAll()}).
    */
   public void invalidateAll() {
     footerCache.invalidateAll();
     smallObjectCache.invalidateAll();
     bucketPropertiesCache.invalidateAll();
+  }
+
+  /**
+   * Clears the JVM-wide static footer and small object caches so a subsequently constructed manager
+   * re-initializes them from its own options. Intended for tests, which share a JVM and therefore
+   * the static caches.
+   */
+  @VisibleForTesting
+  public static synchronized void resetCaches() {
+    footerCache = null;
+    smallObjectCache = null;
   }
 
   /** A loader for GCS object footers. */
