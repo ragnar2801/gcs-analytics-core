@@ -20,8 +20,48 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.channels.WritableByteChannel;
+import java.util.Map;
+import java.util.function.Supplier;
 
 public interface GcsFileSystem extends AutoCloseable {
+
+  /**
+   * Returns the file system for {@code properties}, shared JVM-wide with every other caller whose
+   * properties carry the same authorization and produce the same options, creating it with {@code
+   * credentials} if there is none yet.
+   *
+   * <p>Sharing is a security boundary: callers reaching one entry share cached object data, and
+   * nothing verifies access at lookup time. Build {@code credentials} by switching on {@link
+   * GcsAuthType#of} exhaustively and without a {@code default} branch, so that it and the key,
+   * derived from the same classification, cannot disagree about which mechanism applies.
+   *
+   * <p>{@code credentials} is called only when a file system is created, never on a hit, so a
+   * lookup never pays to mint credentials it would discard. Anything closeable they own is handed
+   * over through {@link GcsCredentials} and closed with the file system, not by the caller.
+   *
+   * <p>The result is owned by the cache and must not be closed. Call this for each use rather than
+   * holding it, so that an entry in use cannot expire underneath its user.
+   *
+   * @param properties the GCS properties, including the credential properties keyed on
+   * @param propertyPrefix prefix the properties are read under, for example {@code "gcs."}
+   * @param storagePrefix the storage location these properties authorize, part of the key
+   * @param credentials the credentials for a new file system, with any resources to close with it
+   */
+  static GcsFileSystem getOrCreate(
+      Map<String, String> properties,
+      String propertyPrefix,
+      String storagePrefix,
+      Supplier<GcsCredentials> credentials) {
+    return GcsFileSystemCache.getOrCreate(properties, propertyPrefix, storagePrefix, credentials);
+  }
+
+  /**
+   * Closes and drops every shared file system. Reads in flight against one will fail, so this is
+   * for tests and deliberate shutdown, not for reclaiming memory.
+   */
+  static void invalidateInstances() {
+    GcsFileSystemCache.invalidateAll();
+  }
 
   /**
    * Opens an object for reading.

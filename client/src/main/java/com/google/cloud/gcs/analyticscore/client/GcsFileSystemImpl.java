@@ -33,7 +33,9 @@ import com.google.common.base.Supplier;
 import com.google.common.base.Suppliers;
 import com.google.common.collect.ImmutableList;
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
+import java.io.Closeable;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.nio.channels.WritableByteChannel;
 import java.util.Collections;
@@ -44,18 +46,32 @@ import java.util.concurrent.TimeUnit;
 
 public class GcsFileSystemImpl implements GcsFileSystem {
 
+  /** Used when a file system was given no credential resources to own. */
+  private static final Closeable NO_CREDENTIAL_RESOURCES = () -> {};
+
   private final GcsClient gcsClient;
   private final GcsFileSystemOptions fileSystemOptions;
   private final Supplier<ExecutorService> executorServiceSupplier;
 
   private final Telemetry telemetry;
   private final AnalyticsCacheManager cacheManager;
+  private final Closeable credentialResources;
 
   public GcsFileSystemImpl(GcsFileSystemOptions fileSystemOptions) {
+    this(fileSystemOptions, NO_CREDENTIAL_RESOURCES);
+  }
+
+  /**
+   * Creates a file system resolving application default credentials for itself, taking ownership of
+   * {@code credentialResources}. See {@link #GcsFileSystemImpl(Credentials, GcsFileSystemOptions,
+   * Closeable)}.
+   */
+  public GcsFileSystemImpl(GcsFileSystemOptions fileSystemOptions, Closeable credentialResources) {
     this.fileSystemOptions = fileSystemOptions;
     this.executorServiceSupplier = initializeExecutionServiceSupplier();
     this.telemetry = createTelemetry(fileSystemOptions.getAnalyticsCoreTelemetryOptions());
     this.cacheManager = new AnalyticsCacheManager(fileSystemOptions.getGcsCacheOptions());
+    this.credentialResources = checkNotNull(credentialResources, "credentialResources is null");
     this.gcsClient =
         telemetry.measure(
             GcsAnalyticsCoreTelemetryConstants.Operation.GCS_CLIENT_CREATE.name(),
@@ -67,10 +83,25 @@ public class GcsFileSystemImpl implements GcsFileSystem {
   }
 
   public GcsFileSystemImpl(Credentials credentials, GcsFileSystemOptions fileSystemOptions) {
+    this(credentials, fileSystemOptions, NO_CREDENTIAL_RESOURCES);
+  }
+
+  /**
+   * Creates a file system that takes ownership of {@code credentialResources}, tying their lifetime
+   * to the file system refreshing through them rather than to whichever caller built them.
+   *
+   * @param credentialResources closed after this file system's own resources; closing must be
+   *     idempotent, as it may already have been closed by an earlier failure path
+   */
+  public GcsFileSystemImpl(
+      Credentials credentials,
+      GcsFileSystemOptions fileSystemOptions,
+      Closeable credentialResources) {
     this.fileSystemOptions = fileSystemOptions;
     this.executorServiceSupplier = initializeExecutionServiceSupplier();
     this.telemetry = createTelemetry(fileSystemOptions.getAnalyticsCoreTelemetryOptions());
     this.cacheManager = new AnalyticsCacheManager(fileSystemOptions.getGcsCacheOptions());
+    this.credentialResources = checkNotNull(credentialResources, "credentialResources is null");
     this.gcsClient =
         telemetry.measure(
             GcsAnalyticsCoreTelemetryConstants.Operation.GCS_CLIENT_CREATE.name(),
@@ -104,6 +135,7 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     this.executorServiceSupplier = initializeExecutionServiceSupplier();
     this.telemetry = telemetry;
     this.cacheManager = cacheManager;
+    this.credentialResources = NO_CREDENTIAL_RESOURCES;
   }
 
   @Override
@@ -177,6 +209,11 @@ public class GcsFileSystemImpl implements GcsFileSystem {
     }
     gcsClient.close();
     telemetry.close();
+    try {
+      credentialResources.close();
+    } catch (IOException e) {
+      throw new UncheckedIOException("Failed to close credential resources", e);
+    }
   }
 
   @Override

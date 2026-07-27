@@ -35,6 +35,7 @@ import com.google.cloud.gcs.analyticscore.common.telemetry.TelemetryOptions;
 import com.google.common.base.Supplier;
 import com.google.common.collect.ImmutableList;
 import java.io.IOException;
+import java.io.UncheckedIOException;
 import java.net.URI;
 import java.net.URISyntaxException;
 import java.nio.channels.WritableByteChannel;
@@ -43,6 +44,7 @@ import java.util.List;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -89,6 +91,33 @@ class GcsFileSystemImplTest {
       assertThat(gcsClientImpl.storage.getOptions().getCredentials())
           .isEqualTo(NoCredentials.getInstance());
     }
+  }
+
+  @Test
+  void close_withCredentialResources_closesThemAfterClient() {
+    AtomicBoolean credentialResourcesClosed = new AtomicBoolean();
+    GcsFileSystemImpl gcsFileSystem =
+        new GcsFileSystemImpl(
+            NoCredentials.getInstance(),
+            TEST_GCS_FILESYSTEM_OPTIONS,
+            () -> credentialResourcesClosed.set(true));
+
+    gcsFileSystem.close();
+
+    assertThat(credentialResourcesClosed.get()).isTrue();
+  }
+
+  @Test
+  void close_whenCredentialResourcesFail_throwsUncheckedIOException() {
+    GcsFileSystemImpl gcsFileSystem =
+        new GcsFileSystemImpl(
+            NoCredentials.getInstance(),
+            TEST_GCS_FILESYSTEM_OPTIONS,
+            () -> {
+              throw new IOException("cannot close refresh handler");
+            });
+
+    assertThrows(UncheckedIOException.class, gcsFileSystem::close);
   }
 
   @Test
