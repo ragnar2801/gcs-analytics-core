@@ -116,4 +116,55 @@ class GcsCacheOptionsTest {
 
     assertThrows(NumberFormatException.class, () -> GcsCacheOptions.createFromOptions(map, "gcs."));
   }
+
+  @Test
+  void build_defaultValues_sharedCacheDisabledNoTtlNoScope() {
+    GcsCacheOptions options = GcsCacheOptions.builder().build();
+
+    assertThat(options.isSharedCacheEnabled()).isFalse();
+    assertThat(options.getFooterCacheTtlSeconds()).isEqualTo(0);
+    assertThat(options.getSmallObjectCacheTtlSeconds()).isEqualTo(0);
+    assertThat(options.getCacheScope()).isEmpty();
+  }
+
+  @Test
+  void createFromOptions_withTtlAndSharedFlag_succeeds() {
+    Map<String, String> map = new HashMap<>();
+    map.put("gcs." + GcsCacheOptions.FOOTER_CACHE_TTL_SECONDS_KEY, "300");
+    map.put("gcs." + GcsCacheOptions.SMALL_FILE_CACHE_TTL_SECONDS_KEY, "600");
+    map.put("gcs." + GcsCacheOptions.SHARED_CACHE_ENABLED_KEY, "true");
+
+    GcsCacheOptions options = GcsCacheOptions.createFromOptions(map, "gcs.");
+
+    assertThat(options.getFooterCacheTtlSeconds()).isEqualTo(300);
+    assertThat(options.getSmallObjectCacheTtlSeconds()).isEqualTo(600);
+    assertThat(options.isSharedCacheEnabled()).isTrue();
+  }
+
+  @Test
+  void createFromOptions_cacheScopeInPropertyMap_isIgnored() {
+    // The scope is a security boundary and must never be honored from the caller-controlled map;
+    // a caller could otherwise set another principal's scope to read their cached bytes.
+    Map<String, String> map = new HashMap<>();
+    map.put("gcs.analytics-core.cache.scope", "gs://someone-elses/prefix/");
+
+    GcsCacheOptions options = GcsCacheOptions.createFromOptions(map, "gcs.");
+
+    assertThat(options.getCacheScope()).isEmpty();
+  }
+
+  @Test
+  void setCacheScope_setsScopeProgrammatically() {
+    GcsCacheOptions options = GcsCacheOptions.builder().setCacheScope("gs://bucket/table/").build();
+
+    assertThat(options.getCacheScope()).hasValue("gs://bucket/table/");
+  }
+
+  @Test
+  void build_negativeTtl_throwsException() {
+    GcsCacheOptions.Builder builder =
+        GcsCacheOptions.builder().setFooterCacheEnabled(true).setFooterCacheTtlSeconds(-1);
+
+    assertThrows(IllegalArgumentException.class, builder::build);
+  }
 }

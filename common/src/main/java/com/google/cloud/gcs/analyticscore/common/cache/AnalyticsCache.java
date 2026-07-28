@@ -17,6 +17,7 @@
 package com.google.cloud.gcs.analyticscore.common.cache;
 
 import java.util.Optional;
+import java.util.function.Predicate;
 
 /**
  * A simple, generic interface for an in-memory cache. All implementations of this interface must be
@@ -62,6 +63,13 @@ public interface AnalyticsCache<K, V> {
 
   /** Discards all entries in the cache. */
   void invalidateAll();
+
+  /**
+   * Discards every entry whose key satisfies the {@code keyPredicate}. Used to invalidate a subset
+   * of a shared cache (for example, all entries belonging to a single scope) without disturbing
+   * entries that belong to other holders of the cache.
+   */
+  void invalidateIf(Predicate<? super K> keyPredicate);
 
   /** Returns the approximate number of entries in this cache. */
   long size();

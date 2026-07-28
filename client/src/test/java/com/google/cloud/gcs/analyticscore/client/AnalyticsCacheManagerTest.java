@@ -22,6 +22,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicInteger;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -38,6 +39,23 @@ class AnalyticsCacheManagerTest {
   void setUp() {
     manager =
         new AnalyticsCacheManager(GcsCacheOptions.builder().setFooterCacheEnabled(true).build());
+  }
+
+  @AfterEach
+  void tearDown() {
+    // The shared caches are process-wide state; reset between tests so first-wins config and
+    // retained entries from one test cannot leak into the next.
+    SharedAnalyticsCaches.resetForTesting();
+  }
+
+  private static GcsCacheOptions sharedOptions(String scope) {
+    return GcsCacheOptions.builder()
+        .setFooterCacheEnabled(true)
+        .setSmallObjectCacheEnabled(true)
+        .setSmallObjectCacheMaxSizeBytes(1_000)
+        .setSharedCacheEnabled(true)
+        .setCacheScope(scope)
+        .build();
   }
 
   @Test
@@ -231,6 +249,173 @@ class AnalyticsCacheManagerTest {
           return BucketProperties.create(true);
         });
 
+    assertThat(callCount.get()).isEqualTo(1);
+  }
+
+  @Test
+  void getFooter_sharedCacheSameScope_sharesEntriesAcrossManagers() throws IOException {
+    AnalyticsCacheManager first = new AnalyticsCacheManager(sharedOptions("gs://bucket/table/"));
+    AnalyticsCacheManager second = new AnalyticsCacheManager(sharedOptions("gs://bucket/table/"));
+    AtomicInteger callCount = new AtomicInteger(0);
+
+    first.getFooter(
+        ITEM_ID,
+        itemId -> {
+          callCount.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+    ByteBuffer fromSecond =
+        second.getFooter(
+            ITEM_ID,
+            itemId -> {
+              callCount.incrementAndGet();
+              return ByteBuffer.wrap(new byte[] {9});
+            });
+
+    // The second, independent manager is served the entry the first one loaded.
+    assertThat(callCount.get()).isEqualTo(1);
+    assertThat(fromSecond).isEqualTo(FOOTER);
+  }
+
+  @Test
+  void getFooter_sharedCacheDifferentScope_doesNotShareEntries() throws IOException {
+    AnalyticsCacheManager tableA = new AnalyticsCacheManager(sharedOptions("gs://bucket/tableA/"));
+    AnalyticsCacheManager tableB = new AnalyticsCacheManager(sharedOptions("gs://bucket/tableB/"));
+    ByteBuffer footerA = ByteBuffer.wrap(new byte[] {1});
+    ByteBuffer footerB = ByteBuffer.wrap(new byte[] {2});
+    AtomicInteger callCount = new AtomicInteger(0);
+
+    tableA.getFooter(
+        ITEM_ID,
+        itemId -> {
+          callCount.incrementAndGet();
+          return footerA.duplicate();
+        });
+    ByteBuffer fromB =
+        tableB.getFooter(
+            ITEM_ID,
+            itemId -> {
+              callCount.incrementAndGet();
+              return footerB.duplicate();
+            });
+
+    // Same object, different authorization scopes: B must load its own bytes, never be served A's.
+    assertThat(callCount.get()).isEqualTo(2);
+    assertThat(fromB).isEqualTo(footerB);
+  }
+
+  @Test
+  void getSmallObject_sharedCacheDifferentScope_doesNotShareEntries() throws IOException {
+    AnalyticsCacheManager tableA = new AnalyticsCacheManager(sharedOptions("gs://bucket/tableA/"));
+    AnalyticsCacheManager tableB = new AnalyticsCacheManager(sharedOptions("gs://bucket/tableB/"));
+    ByteBuffer objectB = ByteBuffer.wrap(new byte[] {2});
+    AtomicInteger callCount = new AtomicInteger(0);
+
+    tableA.getSmallObject(
+        ITEM_ID,
+        itemId -> {
+          callCount.incrementAndGet();
+          return ByteBuffer.wrap(new byte[] {1});
+        });
+    ByteBuffer fromB =
+        tableB.getSmallObject(
+            ITEM_ID,
+            itemId -> {
+              callCount.incrementAndGet();
+              return objectB.duplicate();
+            });
+
+    assertThat(callCount.get()).isEqualTo(2);
+    assertThat(fromB).isEqualTo(objectB);
+  }
+
+  @Test
+  void getFooter_sharedRequestedWithoutScope_fallsBackToPrivateCaches() throws IOException {
+    GcsCacheOptions noScope =
+        GcsCacheOptions.builder().setFooterCacheEnabled(true).setSharedCacheEnabled(true).build();
+    AnalyticsCacheManager first = new AnalyticsCacheManager(noScope);
+    AnalyticsCacheManager second = new AnalyticsCacheManager(noScope);
+    AtomicInteger callCount = new AtomicInteger(0);
+
+    first.getFooter(
+        ITEM_ID,
+        itemId -> {
+          callCount.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+    second.getFooter(
+        ITEM_ID,
+        itemId -> {
+          callCount.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+
+    // No scope means no sharing: each manager keeps a private cache, so both loaders run.
+    assertThat(callCount.get()).isEqualTo(2);
+  }
+
+  @Test
+  void onFileSystemClose_privateCache_clearsEntries() throws IOException {
+    manager.getFooter(ITEM_ID, itemId -> FOOTER.duplicate());
+    AtomicInteger callCount = new AtomicInteger(0);
+
+    manager.onFileSystemClose();
+
+    manager.getFooter(
+        ITEM_ID,
+        itemId -> {
+          callCount.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+    assertThat(callCount.get()).isEqualTo(1);
+  }
+
+  @Test
+  void onFileSystemClose_sharedCache_retainsEntriesForLaterManagers() throws IOException {
+    AnalyticsCacheManager first = new AnalyticsCacheManager(sharedOptions("gs://bucket/table/"));
+    first.getFooter(ITEM_ID, itemId -> FOOTER.duplicate());
+
+    first.onFileSystemClose();
+
+    AnalyticsCacheManager second = new AnalyticsCacheManager(sharedOptions("gs://bucket/table/"));
+    AtomicInteger callCount = new AtomicInteger(0);
+    ByteBuffer fromSecond =
+        second.getFooter(
+            ITEM_ID,
+            itemId -> {
+              callCount.incrementAndGet();
+              return ByteBuffer.wrap(new byte[] {9});
+            });
+
+    // Surviving individual file-system instances is the point of a shared cache.
+    assertThat(callCount.get()).isEqualTo(0);
+    assertThat(fromSecond).isEqualTo(FOOTER);
+  }
+
+  @Test
+  void invalidateAll_sharedCache_clearsOnlyOwnScope() throws IOException {
+    AnalyticsCacheManager tableA = new AnalyticsCacheManager(sharedOptions("gs://bucket/tableA/"));
+    AnalyticsCacheManager tableB = new AnalyticsCacheManager(sharedOptions("gs://bucket/tableB/"));
+    tableA.getFooter(ITEM_ID, itemId -> FOOTER.duplicate());
+    tableB.getFooter(ITEM_ID, itemId -> FOOTER.duplicate());
+
+    tableA.invalidateAll();
+
+    AtomicInteger callCount = new AtomicInteger(0);
+    tableA.getFooter(
+        ITEM_ID,
+        itemId -> {
+          callCount.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+    tableB.getFooter(
+        ITEM_ID,
+        itemId -> {
+          callCount.incrementAndGet();
+          return FOOTER.duplicate();
+        });
+
+    // Only scope A was invalidated: A reloads (loader runs), B is still a hit (loader does not).
     assertThat(callCount.get()).isEqualTo(1);
   }
 }

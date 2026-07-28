@@ -115,4 +115,42 @@ class AnalyticsCacheCaffeineImplTest {
 
     assertThat(cache.size()).isEqualTo(2);
   }
+
+  @Test
+  void invalidateIf_removesOnlyMatchingKeys() {
+    cache.put("scopeA:key1", "value1");
+    cache.put("scopeA:key2", "value2");
+    cache.put("scopeB:key1", "value3");
+
+    cache.invalidateIf(key -> key.startsWith("scopeA:"));
+
+    assertThat(cache.get("scopeA:key1")).isEmpty();
+    assertThat(cache.get("scopeA:key2")).isEmpty();
+    assertThat(cache.get("scopeB:key1")).hasValue("value3");
+  }
+
+  @Test
+  void invalidateIf_nullPredicate_throwsException() {
+    NullPointerException exception =
+        assertThrows(NullPointerException.class, () -> cache.invalidateIf(null));
+    assertThat(exception).hasMessageThat().contains("keyPredicate cannot be null");
+  }
+
+  @Test
+  void create_withTtl_cachesValues() {
+    AnalyticsCacheCaffeineImpl<String, String> ttlCache =
+        AnalyticsCacheCaffeineImpl.create(10, (key, value) -> 1, 60);
+    ttlCache.put("key1", "value1");
+
+    assertThat(ttlCache.get("key1")).hasValue("value1");
+  }
+
+  @Test
+  void create_negativeTtl_throwsException() {
+    IllegalArgumentException exception =
+        assertThrows(
+            IllegalArgumentException.class,
+            () -> AnalyticsCacheCaffeineImpl.create(10, (key, value) -> 1, -1));
+    assertThat(exception).hasMessageThat().contains("ttlSeconds cannot be negative");
+  }
 }

@@ -24,6 +24,7 @@ import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.Weigher;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 /**
  * An {@link AnalyticsCache} implementation backed by a Caffeine {@link Cache}. This implementation
@@ -36,10 +37,15 @@ public class AnalyticsCacheCaffeineImpl<K, V> implements AnalyticsCache<K, V> {
 
   private final Cache<K, V> cache;
 
-  private AnalyticsCacheCaffeineImpl(long maxWeight, Weigher<K, V> weigher) {
+  private AnalyticsCacheCaffeineImpl(long maxWeight, Weigher<K, V> weigher, long ttlSeconds) {
     checkArgument(maxWeight > 0, "maxWeight must be positive");
     checkNotNull(weigher, "weigher cannot be null");
-    this.cache = Caffeine.newBuilder().maximumWeight(maxWeight).weigher(weigher).build();
+    checkArgument(ttlSeconds >= 0, "ttlSeconds cannot be negative");
+    Caffeine<K, V> builder = Caffeine.newBuilder().maximumWeight(maxWeight).weigher(weigher);
+    if (ttlSeconds > 0) {
+      builder.expireAfterWrite(ttlSeconds, TimeUnit.SECONDS);
+    }
+    this.cache = builder.build();
   }
 
   private AnalyticsCacheCaffeineImpl(long ttl, TimeUnit unit) {
@@ -53,7 +59,19 @@ public class AnalyticsCacheCaffeineImpl<K, V> implements AnalyticsCache<K, V> {
    */
   public static <K, V> AnalyticsCacheCaffeineImpl<K, V> create(
       long maxWeight, Weigher<K, V> weigher) {
-    return new AnalyticsCacheCaffeineImpl<>(maxWeight, weigher);
+    return new AnalyticsCacheCaffeineImpl<>(maxWeight, weigher, 0);
+  }
+
+  /**
+   * Creates a new {@link AnalyticsCacheCaffeineImpl} bounded by {@code maxWeight} and, when {@code
+   * ttlSeconds} is positive, an {@code expireAfterWrite} time-to-live. A TTL bounds how long an
+   * entry can be served after it was loaded, which is what keeps cached bytes from outliving the
+   * credential that authorized the read that produced them. A {@code ttlSeconds} of {@code 0}
+   * disables time-based expiry.
+   */
+  public static <K, V> AnalyticsCacheCaffeineImpl<K, V> create(
+      long maxWeight, Weigher<K, V> weigher, long ttlSeconds) {
+    return new AnalyticsCacheCaffeineImpl<>(maxWeight, weigher, ttlSeconds);
   }
 
   /** Creates a new {@link AnalyticsCacheCaffeineImpl} with the specified time-to-live. */
@@ -118,6 +136,13 @@ public class AnalyticsCacheCaffeineImpl<K, V> implements AnalyticsCache<K, V> {
   @Override
   public void invalidateAll() {
     cache.invalidateAll();
+  }
+
+  /** {@inheritDoc} */
+  @Override
+  public void invalidateIf(Predicate<? super K> keyPredicate) {
+    checkNotNull(keyPredicate, "keyPredicate cannot be null");
+    cache.asMap().keySet().removeIf(keyPredicate);
   }
 
   /** {@inheritDoc} */
