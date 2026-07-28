@@ -30,9 +30,16 @@ These settings control how aggressively the library prefetches and caches metada
 | `analytics-core.large-file.footer.prefetch.size-bytes` | Footer prefetch size (in bytes) for files larger than 1 GB. | `1048576` (1 MB) |
 | `analytics-core.footer.cache.enabled` | Controls whether the Parquet footer cache is enabled. | `false` |
 | `analytics-core.footer.cache.max-size-bytes`                 | The maximum capacity (in bytes) to hold in the Parquet footer cache.                        | `104857600` (100 MB) |
+| `analytics-core.footer.cache.ttl-seconds` | Time-to-live (in seconds) for footer cache entries; `0` disables time-based expiry. | `0` |
 | `analytics-core.small-file.cache.threshold-bytes` | Threshold (in bytes) below which small files are cached entirely. | `1048576` (1 MB) |
 | `analytics-core.small-file.cache.enabled` | Controls whether the small object cache is enabled. | `false` |
 | `analytics-core.small-file.cache.max-size-bytes` | The maximum capacity (in bytes) to hold in the small object cache. | `209715200` (200 MB) |
+| `analytics-core.small-file.cache.ttl-seconds` | Time-to-live (in seconds) for small-object cache entries; `0` disables time-based expiry. | `0` |
+| `analytics-core.cache.shared.enabled` | Share the footer and small-object caches across file system instances in the JVM. Only takes effect when the integration supplies a cache scope (see note below). | `false` |
+
+> **Security note on caching and credentials.** A cache hit is served from memory without contacting GCS, so no credential is checked. Two safeguards keep cached bytes from outliving or crossing the credential that authorized them:
+> - **TTL** (`*.cache.ttl-seconds`) bounds how long an object can be served after the read that loaded it. When reading under short-lived vended credentials, set the TTL at or below the credential lifetime so revoked or expired access stops serving from cache.
+> - **Cache scope** partitions a shared cache by authorization boundary. It is supplied programmatically by the integration layer (for example, the object-name prefix a credential was vended for) and is deliberately **not** configurable through the property map — a property could otherwise be set to another principal's scope. Without a scope, a "shared" cache stays private to each file system instance so that bytes read under one credential are never served to another.
 
 ### Read Performance and I/O Tuning
 

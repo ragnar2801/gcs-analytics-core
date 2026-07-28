@@ -24,11 +24,29 @@ import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCacheCaffeineImp
 import com.google.cloud.gcs.analyticscore.common.cache.AnalyticsCacheNoOpImpl;
 import java.io.IOException;
 import java.nio.ByteBuffer;
+import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 
 /**
  * Manages the caching layer for GCS objects. This class is thread-safe and acts as a registry for
  * various specialized caches (e.g., Parquet footer cache).
+ *
+ * <p>The footer and small-object caches can operate in two modes, selected by {@link
+ * GcsCacheOptions#isSharedCacheEnabled()}:
+ *
+ * <ul>
+ *   <li><b>Private (default):</b> each manager owns its caches, which live and die with the
+ *       enclosing {@link GcsFileSystem}. This is the historical behavior.
+ *   <li><b>Shared:</b> the manager delegates to process-wide caches (see {@link
+ *       SharedAnalyticsCaches}) so a warm cache survives across the short-lived file systems an
+ *       engine creates per task. Entries are partitioned by an authorization-boundary scope so
+ *       that, even though the underlying storage is shared, a caller can only be served bytes that
+ *       were read under its own scope.
+ * </ul>
+ *
+ * <p>Sharing takes effect only when a non-empty {@link GcsCacheOptions#getCacheScope() cache scope}
+ * is present. If sharing is requested without a scope, the manager falls back to private caches
+ * rather than pooling entries under an empty, everyone-matches scope; this fails closed.
  */
 public class AnalyticsCacheManager {
 
@@ -38,9 +56,20 @@ public class AnalyticsCacheManager {
    */
   private static final long BUCKET_PROPERTIES_CACHE_TTL_MINUTES = 10;
 
-  private final AnalyticsCache<GcsItemId, ByteBuffer> footerCache;
-  private final AnalyticsCache<GcsItemId, ByteBuffer> smallObjectCache;
+  private final AnalyticsCache<CacheKey, ByteBuffer> footerCache;
+  private final AnalyticsCache<CacheKey, ByteBuffer> smallObjectCache;
   private final AnalyticsCache<String, BucketProperties> bucketPropertiesCache;
+
+  /** The scope under which this manager reads and writes entries in the footer/small caches. */
+  private final String scope;
+
+  /**
+   * Whether {@link #footerCache}/{@link #smallObjectCache} are the process-wide shared caches. When
+   * {@code true}, entries survive this manager (bounded by size and TTL) and invalidation is
+   * restricted to this manager's {@link #scope}; when {@code false} the caches are private and are
+   * cleared wholesale when the file system closes.
+   */
+  private final boolean usingSharedCache;
 
   /**
    * Creates a new {@link AnalyticsCacheManager} with the specified options.
@@ -49,15 +78,35 @@ public class AnalyticsCacheManager {
    */
   public AnalyticsCacheManager(GcsCacheOptions options) {
     checkNotNull(options, "options cannot be null");
-    Weigher<GcsItemId, ByteBuffer> weigher = (key, value) -> value.remaining();
-    this.footerCache =
-        options.isFooterCacheEnabled()
-            ? AnalyticsCacheCaffeineImpl.create(options.getFooterCacheMaxSizeBytes(), weigher)
-            : AnalyticsCacheNoOpImpl.getInstance();
-    this.smallObjectCache =
-        options.isSmallObjectCacheEnabled()
-            ? AnalyticsCacheCaffeineImpl.create(options.getSmallObjectCacheMaxSizeBytes(), weigher)
-            : AnalyticsCacheNoOpImpl.getInstance();
+
+    boolean shareRequested = options.isSharedCacheEnabled();
+    String requestedScope = options.getCacheScope().filter(s -> !s.isEmpty()).orElse(null);
+    this.usingSharedCache = shareRequested && requestedScope != null;
+
+    if (usingSharedCache) {
+      SharedAnalyticsCaches shared = SharedAnalyticsCaches.getInstance(options);
+      this.footerCache = shared.footerCache();
+      this.smallObjectCache = shared.smallObjectCache();
+      this.scope = requestedScope;
+    } else {
+      Weigher<CacheKey, ByteBuffer> weigher = (key, value) -> value.remaining();
+      this.footerCache =
+          options.isFooterCacheEnabled()
+              ? AnalyticsCacheCaffeineImpl.create(
+                  options.getFooterCacheMaxSizeBytes(), weigher, options.getFooterCacheTtlSeconds())
+              : AnalyticsCacheNoOpImpl.getInstance();
+      this.smallObjectCache =
+          options.isSmallObjectCacheEnabled()
+              ? AnalyticsCacheCaffeineImpl.create(
+                  options.getSmallObjectCacheMaxSizeBytes(),
+                  weigher,
+                  options.getSmallObjectCacheTtlSeconds())
+              : AnalyticsCacheNoOpImpl.getInstance();
+      // A per-instance scope keeps composite keys well-formed. The caches are private, so this
+      // value is never compared against another manager's entries.
+      this.scope = "private-" + UUID.randomUUID();
+    }
+
     this.bucketPropertiesCache =
         AnalyticsCacheCaffeineImpl.createWithTtlOnly(
             BUCKET_PROPERTIES_CACHE_TTL_MINUTES, TimeUnit.MINUTES);
@@ -78,7 +127,7 @@ public class AnalyticsCacheManager {
     checkNotNull(footerLoader, "footerLoader cannot be null");
 
     return footerCache
-        .get(itemId, cachedItemId -> footerLoader.load(cachedItemId))
+        .get(CacheKey.create(scope, itemId), key -> footerLoader.load(key.getItemId()))
         .asReadOnlyBuffer();
   }
 
@@ -94,20 +143,20 @@ public class AnalyticsCacheManager {
     checkNotNull(smallObjectLoader, "smallObjectLoader cannot be null");
 
     return smallObjectCache
-        .get(itemId, cachedItemId -> smallObjectLoader.load(cachedItemId))
+        .get(CacheKey.create(scope, itemId), key -> smallObjectLoader.load(key.getItemId()))
         .asReadOnlyBuffer();
   }
 
   /** Invalidates the cached footer for the given {@code itemId}. */
   public void invalidateFooter(GcsItemId itemId) {
     checkNotNull(itemId, "itemId cannot be null");
-    footerCache.invalidate(itemId);
+    footerCache.invalidate(CacheKey.create(scope, itemId));
   }
 
   /** Invalidates the cached small object for the given {@code itemId}. */
   public void invalidateSmallObject(GcsItemId itemId) {
     checkNotNull(itemId, "itemId cannot be null");
-    smallObjectCache.invalidate(itemId);
+    smallObjectCache.invalidate(CacheKey.create(scope, itemId));
   }
 
   /**
@@ -130,11 +179,38 @@ public class AnalyticsCacheManager {
     bucketPropertiesCache.invalidate(bucketName);
   }
 
-  /** Invalidates all cached entries. */
+  /**
+   * Invalidates all cached entries visible to this manager.
+   *
+   * <p>For a shared cache this drops only entries belonging to this manager's scope, leaving
+   * entries owned by other scopes (and therefore other credentials) untouched; for a private cache
+   * it clears everything.
+   */
   public void invalidateAll() {
-    footerCache.invalidateAll();
-    smallObjectCache.invalidateAll();
+    if (usingSharedCache) {
+      footerCache.invalidateIf(key -> scope.equals(key.getScope()));
+      smallObjectCache.invalidateIf(key -> scope.equals(key.getScope()));
+    } else {
+      footerCache.invalidateAll();
+      smallObjectCache.invalidateAll();
+    }
     bucketPropertiesCache.invalidateAll();
+  }
+
+  /**
+   * Releases cache resources tied to the enclosing {@link GcsFileSystem} when it closes.
+   *
+   * <p>Private caches are cleared wholesale, matching the file system's lifetime. Shared footer and
+   * small-object entries are intentionally left in place — surviving individual file systems is the
+   * point of a shared cache — and remain bounded by their size limit and TTL; only the per-instance
+   * bucket-properties cache is cleared.
+   */
+  public void onFileSystemClose() {
+    if (usingSharedCache) {
+      bucketPropertiesCache.invalidateAll();
+    } else {
+      invalidateAll();
+    }
   }
 
   /** A loader for GCS object footers. */
